@@ -384,12 +384,22 @@ selects the npm release, and persistent MCP registrations are pinned to the
 version that performed setup. Installing newer instructions does not update a
 running server or its registration.
 
-The npm release checked on **2026-10-11** was **6.4.0**, published from
+Current package snapshot (**2026-10-21**): the npm registry `latest` tag is
+**6.7.0**, while this fork's default-branch `package.json` still declares **6.4.0**.
+These are different source/package snapshots; do not relabel this checkout as
+6.7.0 or assume the published package matches its bytes. The 6.7.0 package
+requires Node `^22.19.0 || ^24.11.0 || >=26.0.0`, and its bundled client catalog
+contains DeepSeek Harness (`dsh`). This check inspected registry metadata and
+the published tarball; it did not run setup or verify a live client integration.
+
+Historical verification: the npm release checked on **2026-10-11** was
+**6.4.0**, published from
 [`a56f7bb6`](https://github.com/morluto/rea/commit/a56f7bb668ab23fec8d33f7af353ac7ed2fe1895).
 The actual registry package accepted dry-run setup plans for the 17 client IDs
 in that release, including Qwen Code, Pi and Hermes. DeepSeek Harness (`dsh`)
-is on main and is not in npm 6.4.0; `rea setup --client dsh` against `@latest`
-reports an unsupported client until a release containing it is published.
+is on main and is not in npm 6.4.0; that historical package reports an
+unsupported client for `rea setup --client dsh`. This limitation must not be
+applied to the current `@latest` package, whose catalog now includes `dsh`.
 OpenCode's plan selected
 `OPENCODE_CONFIG_DIR` even when that directory did not yet exist. These checks
 used an isolated home on macOS with Node 24; they verify planning and argument
