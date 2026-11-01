@@ -2,15 +2,20 @@ import { createHash } from "node:crypto";
 import {
   chmod,
   mkdir,
+  open,
   readFile,
   truncate,
   writeFile,
   symlink,
 } from "node:fs/promises";
 import { join } from "node:path";
-const args = process.argv.slice(2);
+const engine = process.argv[2];
+if (engine !== "binwalk" && engine !== "unblob")
+  throw new Error(
+    "Firmware fixture requires an explicit binwalk or unblob engine",
+  );
+const args = process.argv.slice(3);
 const mode = process.env.REA_FIRMWARE_FIXTURE_MODE;
-const engine = process.env.REA_FIRMWARE_FIXTURE_ENGINE;
 const banner = process.env.REA_FIRMWARE_FIXTURE_VERSION;
 if (args.includes("--version")) {
   console.log(
@@ -140,9 +145,26 @@ if (args.includes("--version")) {
       // accept it even though the unknown chunk's range is small.
       const oversized = 128 * 1024 * 1024 + 1;
       await truncate(child, oversized);
-      const oversizedHash = createHash("sha256")
-        .update(await readFile(child))
-        .digest("hex");
+      const oversizedDigest = createHash("sha256");
+      // Reuse one buffer under the real engine's address-space ceiling instead
+      // of depending on when Node collects the stream's retired chunk buffers.
+      const source = await open(child, "r");
+      try {
+        const buffer = Buffer.alloc(64 * 1024);
+        for (;;) {
+          const { bytesRead } = await source.read(
+            buffer,
+            0,
+            buffer.length,
+            null,
+          );
+          if (bytesRead === 0) break;
+          oversizedDigest.update(buffer.subarray(0, bytesRead));
+        }
+      } finally {
+        await source.close();
+      }
+      const oversizedHash = oversizedDigest.digest("hex");
       const nestedUnknownRecords = [
         {
           task: childTask,
@@ -319,9 +341,9 @@ if (args.includes("--version")) {
                           dependencies: ["sasquatch"],
                         }
                       : {
-                          __typename__: "ExtractorExecutionErrorReport",
+                          __typename__: "UnknownError",
                           severity: "ERROR",
-                          handler: "tar",
+                          exception: "inert multi-file extraction failure",
                         },
                   ],
                 },
@@ -353,6 +375,31 @@ if (args.includes("--version")) {
         subtasks: [childTask],
       },
     ];
+    if (mode === "mixed-failures") {
+      const reports = [
+        {
+          __typename__: "ExtractorDependencyNotFoundReport",
+          severity: "ERROR",
+          dependencies: ["sasquatch"],
+        },
+        {
+          __typename__: "UnknownError",
+          severity: "ERROR",
+          exception: "independent extraction failure",
+        },
+      ];
+      records[1].reports.find(
+        (report) => report.__typename__ === "ChunkReport",
+      ).extraction_reports = reports;
+      records[1].reports.push({
+        __typename__: "MultiFileReport",
+        id: "mixed-id",
+        handler_name: "tar",
+        name: "rootfs.tar",
+        paths: [],
+        extraction_reports: reports,
+      });
+    }
     if (mode === "many-unknown") {
       records[1].reports = [
         ...records[1].reports,
@@ -375,6 +422,23 @@ if (args.includes("--version")) {
         },
       ];
     }
+    if (mode === "task-error" || mode === "task-warning")
+      records[1].reports.push(
+        mode === "task-error"
+          ? {
+              __typename__: "UnknownError",
+              severity: "ERROR",
+              exception: "inert task exception",
+            }
+          : {
+              __typename__: "ExtractCommandFailedReport",
+              severity: "WARNING",
+              command: "fixture",
+              stdout: "",
+              stderr: "",
+              exit_code: 1,
+            },
+      );
     if (
       mode !== "depth-reentry" &&
       mode !== "depth-orphan" &&
@@ -387,7 +451,11 @@ if (args.includes("--version")) {
           ? "["
           : JSON.stringify(records),
       );
-    if (mode === "dependency" || mode === "multi-file-dependency")
+    if (
+      mode === "dependency" ||
+      mode === "multi-file-dependency" ||
+      mode === "task-error"
+    )
       process.exitCode = 1;
     if (
       mode === "workspace-cleanup-failure" ||

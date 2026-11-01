@@ -1,17 +1,14 @@
 import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
-import {
-  requireAnalysisViewRetention,
-  summarizeRetainedAnalysis,
-} from "../application/analysisView/AnalysisViewService.js";
-
 import type { AnalysisOperationPort } from "../application/AnalysisProvider.js";
-import { MANAGED_TOOL_CONTRACTS } from "../contracts/managed/managedToolContracts.js";
+import {
+  MANAGED_TOOL_CONTRACTS,
+  isManagedToolName,
+} from "../contracts/managed/managedToolContracts.js";
 import { AnalysisInputError } from "../domain/analysisErrorCore.js";
-import { err, ok } from "../domain/result.js";
+import { err } from "../domain/result.js";
 import { registerEvidenceTools } from "./registerEvidenceTools.js";
 import type { EvidenceToolFamilyOptions } from "./retainedSummaryDelivery.js";
 import { runManagedProviderExecution } from "../composition/directAnalysis.js";
-import { isManagedToolName } from "../contracts/managed/managedToolContracts.js";
 
 /** Register execution-free managed PE/CLI inspection. */
 export const registerManagedTools = (
@@ -25,17 +22,6 @@ export const registerManagedTools = (
     execute: async (operation, parameters, executionOptions) => {
       if (!isManagedToolName(operation))
         return analysis.execute(operation, parameters, executionOptions);
-      const { detail: _detail, ...artifactParameters } = parameters;
-      if (
-        operation === "inspect_managed_artifact" &&
-        parameters.detail === "summary"
-      ) {
-        const ready = requireAnalysisViewRetention(operation, {
-          recordEvidence: options.recordEvidence,
-          evidenceById: options.evidenceById,
-        });
-        if (!ready.ok) return ready;
-      }
       const requestedPath = parameters.path;
       const activeTarget = options.activeTarget?.();
       const path =
@@ -60,9 +46,7 @@ export const registerManagedTools = (
         path,
         operation,
         executionOptions?.signal,
-        operation === "inspect_managed_artifact"
-          ? artifactParameters
-          : parameters,
+        parameters,
       );
       if (execution.ok && typeof requestedPath === "string")
         selectedManagedPath = requestedPath;
@@ -72,13 +56,5 @@ export const registerManagedTools = (
   registerEvidenceTools(server, MANAGED_TOOL_CONTRACTS, {
     ...options,
     analysisForAdmission,
-    projectEvidence: (operation, parameters, evidence) =>
-      operation === "inspect_managed_artifact" &&
-      parameters.detail === "summary"
-        ? summarizeRetainedAnalysis(evidence, {
-            recordEvidence: options.recordEvidence,
-            evidenceById: options.evidenceById,
-          })
-        : ok(evidence),
   });
 };
