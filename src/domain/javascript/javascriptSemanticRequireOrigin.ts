@@ -4,9 +4,14 @@ import {
   semanticProjectedSourceEligibilityAtRead,
   semanticNormalizeCapturedSelections,
   semanticShiftCapturedSelections,
+  hasFreshProjectedReceiver,
   type SemanticCapturedSelection,
 } from "./javascriptSemanticProjectedSources.js";
 import * as t from "@babel/types";
+import {
+  createGlobalPathReader,
+  type GlobalReferenceRead,
+} from "./javascriptSemanticAmbientWrites.js";
 import { traverseJavaScriptValueAst } from "./javascriptSemanticTraversal.js";
 
 import { BUILTIN_RESOURCE_METHODS } from "./javascriptBuiltinResourceMethods.js";
@@ -15,6 +20,7 @@ import type { JavaScriptModuleOrigin } from "./javascriptSemanticIr.js";
 import {
   resolveSemanticBindingState,
   semanticResolutionBlocked,
+  semanticPrototypeOwners,
   semanticStableInitializer,
   type JavaScriptSemanticAnalysisState,
   type JavaScriptBindingIndex,
@@ -24,12 +30,13 @@ import {
   isUnmodifiedCommonJsWrapperBinding,
   semanticBindingAtRead,
   semanticBindingHasPriorValueWrite,
-  semanticEffectTiming,
-  semanticTopLevelEffectFollowsCapture,
 } from "./javascriptSemanticMutationInitializers.js";
 import {
+  readExactJavaScriptLiteral,
   semanticStaticPropertyKey,
   semanticMemberChain,
+  semanticWriteSiteTarget,
+  semanticWriteTargets,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import { semanticPropertyPathKeyMatches } from "./javascriptSemanticPropertyPaths.js";
@@ -37,11 +44,25 @@ import {
   staticSourceRelativeUrlPath,
   stringValue,
 } from "./javascriptStaticAnalysisHelpers.js";
-import { createSemanticModuleInterop } from "./javascriptModuleInterop.js";
+import {
+  createSemanticModuleInterop,
+  semanticModuleInteropWithAmbientWrites,
+} from "./javascriptModuleInterop.js";
+import {
+  ambientBindingMayObserveWriteAt,
+  ambientPathMayObserveAt,
+  ambientPathOrMemberMayHaveChanged,
+  bindingHasUnmodeledMemberValues,
+  opaqueCodeMayRebindBinding,
+  semanticEffectMayPrecede,
+  semanticMemberWriteSources,
+} from "./javascriptSemanticEffectLog.js";
+import { semanticGlobalCodeSites } from "./javascriptSemanticEffectRecord.js";
 import { createSemanticReturnedReferences } from "./javascriptSemanticReturnedReferences.js";
 import { semanticIterationSources } from "./javascriptSemanticIterationSources.js";
 import {
   semanticCommonJsRequireOwnEnumerableAt,
+  semanticReferenceIterationUnknown,
   semanticReferenceSourcesInactive,
 } from "./javascriptSemanticReferenceSources.js";
 import {
@@ -53,7 +74,6 @@ import {
   semanticAliasSelectionChoices,
   type SemanticAliasSelectionPath,
 } from "./javascriptSemanticAliasSelections.js";
-import { SEMANTIC_ALIAS_SELECTION_LIMIT } from "./javascriptSemanticResourceLimits.js";
 import {
   semanticRequireOriginReaders,
   type JavaScriptRequireLoaderFact,
@@ -62,15 +82,24 @@ import {
 import {
   isUnmodifiedGlobalReference,
   isUnmodifiedImportMetaUrl,
-} from "./javascriptSemanticAmbientWrites.js";
-
-export type {
-  JavaScriptRequireLoaderFact,
-  JavaScriptRequireOrigin,
-} from "./javascriptSemanticRequireOriginSlot.js";
+} from "./javascriptSemanticGlobalReference.js";
 
 const possibleCommonJsDelegateWriteStates =
   new WeakSet<JavaScriptSemanticAnalysisState>();
+
+/** Admission and indexing share the same direct, projected and iteration leaves. */
+function* commonJsDelegateWriteTargets(
+  node: t.Node,
+): Generator<t.MemberExpression | t.OptionalMemberExpression> {
+  const write = semanticWriteSiteTarget(node);
+  if (write === null) return;
+  for (const target of semanticWriteTargets(write)) {
+    if (!t.isMemberExpression(target) && !t.isOptionalMemberExpression(target))
+      continue;
+    const key = semanticStaticPropertyKey(target.property, target.computed);
+    if (key === "require" || (key === null && target.computed)) yield target;
+  }
+}
 
 /** Source eligibility only; the shared write owner still proves receiver identity. */
 export const observePossibleCommonJsDelegateWrite = (
@@ -78,24 +107,13 @@ export const observePossibleCommonJsDelegateWrite = (
   state: JavaScriptSemanticAnalysisState,
 ): void => {
   if (possibleCommonJsDelegateWriteStates.has(state)) return;
-  const target = t.isAssignmentExpression(node)
-    ? node.left
-    : t.isUpdateExpression(node) ||
-        t.isUnaryExpression(node, { operator: "delete" })
-      ? node.argument
-      : undefined;
   if (
     semanticIterationSources(node, state.parentsByNode.get(node) ?? null).some(
       (source) => source.kind === "reference-store",
     )
   )
     possibleCommonJsDelegateWriteStates.add(state);
-  if (
-    (t.isMemberExpression(target) || t.isOptionalMemberExpression(target)) &&
-    ["require", null].includes(
-      semanticStaticPropertyKey(target.property, target.computed),
-    )
-  )
+  if (!commonJsDelegateWriteTargets(node).next().done)
     possibleCommonJsDelegateWriteStates.add(state);
   else if (t.isCallExpression(node) || t.isOptionalCallExpression(node))
     possibleCommonJsDelegateWriteStates.add(state);
@@ -117,8 +135,8 @@ const commonJsDelegateChangedAt = (
   node: t.Node,
   state: JavaScriptSemanticAnalysisState,
 ): boolean =>
-  writesModuleRequire(state).some(
-    (write) => semanticEffectTiming(node, write.node, state) !== "after",
+  writesModuleRequire(state).some((write) =>
+    semanticEffectMayPrecede(state, node, write),
   );
 
 const commonJsLoaderAt = (
@@ -178,9 +196,7 @@ const requireLoaderValueAt = (
       semanticResolutionBlocked(state, loader, "require")
     )
       return "unknown";
-    return (state.ambientBindingWrites.get("require") ?? []).some(
-      (write) => semanticEffectTiming(node, write, state) !== "after",
-    )
+    return ambientBindingMayObserveWriteAt(state, node, "require")
       ? "unknown"
       : commonJsLoaderAt(node, state);
   }
@@ -413,14 +429,14 @@ const selectedRequireSourcesAt = (
     if (paths.has(key)) continue;
     paths.add(key);
     seen.set(node, paths);
-    if (++count > SEMANTIC_ALIAS_SELECTION_LIMIT) {
+    if (++count > state.precision.alias_selections) {
       state.valueResourceLimits.add("alias-selections");
       return { loader: "unknown", sourceRelative: false };
     }
     if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node)) {
       pending.push(
         ...inheritLoaderSourceContext(current, [
-          loaderMemberSource(current, node),
+          loaderMemberSource(current, node, state.parentsByNode),
         ]),
       );
     } else if (t.isIdentifier(node)) {
@@ -587,6 +603,9 @@ const selectedRequireSourcesAt = (
             returned.references.map((reference) => ({
               node: reference.node,
               path: reference.projection,
+              // The immediate invocation produces this value before the
+              // receiving call can apply opaque effects to it.
+              readAt: node,
             })),
           ),
         );
@@ -673,35 +692,6 @@ const selectedRequireSourcesAt = (
           : {}),
       }
     : undefined;
-};
-
-const loaderInvocationInterops = new WeakMap<
-  JavaScriptSemanticAnalysisState,
-  {
-    readonly writes: number;
-    readonly interop: ReturnType<typeof createSemanticModuleInterop>;
-  }
->();
-
-const loaderInvocationInterop = (state: JavaScriptSemanticAnalysisState) => {
-  const prior = loaderInvocationInterops.get(state);
-  if (prior?.writes === state.ambientWriteEffects.length) return prior.interop;
-  const interop = createSemanticModuleInterop(state);
-  for (const effect of state.ambientWriteEffects)
-    if (effect.path[0] === "global")
-      interop.retainWrite(effect.node ?? state.program, [
-        "intrinsic",
-        ...effect.path
-          .slice(1)
-          .map((key) =>
-            key === null || typeof key === "object" ? null : String(key),
-          ),
-      ]);
-  loaderInvocationInterops.set(state, {
-    writes: state.ambientWriteEffects.length,
-    interop,
-  });
-  return interop;
 };
 
 export interface JavaScriptRequireCallFact {
@@ -885,8 +875,11 @@ export const semanticRequireCallAt = (
           : { sourceRelativePath: selected.sourceRelativePath }),
       };
   }
-  const interop = loaderInvocationInterop(state);
+  const interop = semanticModuleInteropWithAmbientWrites(state);
   if (!t.isNewExpression(node)) {
+    // Invocation normalization retains the selected path identity. Keep its
+    // filename alongside that path rather than selecting the outer call again.
+    const sourceRelativePaths = new Map<readonly string[], string>();
     const invocation = interop.intrinsicInvocation(node, (callee) => {
       const loader = requireLoaderValueAt(
         callee,
@@ -913,22 +906,21 @@ export const semanticRequireCallAt = (
         state,
         factoryBindingIds,
       );
-      if (selected !== undefined)
-        return [
+      if (selected !== undefined) {
+        const path = [
           "require-loader",
           selected.loader,
           selected.sourceRelative ? "relative" : "unknown",
           ...(selected.loaderAuthority === "candidate" ? ["candidate"] : []),
         ];
+        if (selected.sourceRelativePath !== undefined)
+          sourceRelativePaths.set(path, selected.sourceRelativePath);
+        return path;
+      }
       return interop.intrinsicPath(callee);
     });
     if (invocation?.path[0] === "require-loader") {
-      const selected = selectedRequireSourcesAt(
-        node.callee,
-        node,
-        state,
-        factoryBindingIds,
-      );
+      const sourceRelativePath = sourceRelativePaths.get(invocation.path);
       return {
         operation: "load",
         loader:
@@ -943,9 +935,9 @@ export const semanticRequireCallAt = (
           : {}),
         sourceRelative:
           invocation.kind === "known" && invocation.path[2] === "relative",
-        ...(selected?.sourceRelativePath === undefined
-          ? {}
-          : { sourceRelativePath: selected.sourceRelativePath }),
+        ...(invocation.kind === "known" && sourceRelativePath !== undefined
+          ? { sourceRelativePath }
+          : {}),
       };
     }
   }
@@ -997,20 +989,10 @@ const isWrapperRequireInitializerCall = (
   );
 };
 
-// Ambient indexing finishes before these derived facts are consumed. Keep only
-// replacement sites, rather than rescanning unrelated global member writes.
-const globalProcessReplacements = new WeakMap<
-  JavaScriptSemanticAnalysisState,
-  readonly (t.Node | undefined)[]
->();
 type ModuleSourceMatch = "possible" | "no-match" | "incomplete";
-type ModuleRequireWrite = {
-  readonly node: t.Node;
-  readonly resolution: "possible" | "incomplete";
-};
 const moduleRequireWrites = new WeakMap<
   JavaScriptSemanticAnalysisState,
-  readonly ModuleRequireWrite[]
+  readonly t.Node[]
 >();
 const moduleReturnedReferences = new WeakMap<
   JavaScriptSemanticAnalysisState,
@@ -1081,6 +1063,7 @@ const inheritLoaderSourceContext = (
 const loaderMemberSource = (
   current: ModuleObjectSource,
   member: t.MemberExpression | t.OptionalMemberExpression,
+  parents: WeakMap<t.Node, t.Node>,
 ): ModuleObjectSource => ({
   node: member.object,
   readAt: current.readAt ?? member,
@@ -1088,7 +1071,17 @@ const loaderMemberSource = (
     current.readAt === undefined
       ? semanticShiftCapturedSelections(current.capturedSelections, 1)
       : semanticNormalizeCapturedSelections([
-          { at: member, depth: 1 },
+          {
+            // A later consumer must not time a read that already fed an
+            // earlier assignment. `box.load = box.load || null` reads
+            // `box.load` before that write.
+            at:
+              current.path.length === 0 &&
+              !memberFeedsEarlierAssignment(member, current.readAt, parents)
+                ? current.readAt
+                : member,
+            depth: 1,
+          },
           ...(semanticShiftCapturedSelections(current.capturedSelections, 1) ??
             []),
         ]),
@@ -1097,6 +1090,30 @@ const loaderMemberSource = (
     ...current.path,
   ],
 });
+
+/** True when this member is an input of an assignment that already ran. */
+const memberFeedsEarlierAssignment = (
+  member: t.Node,
+  readAt: t.Node,
+  parents: WeakMap<t.Node, t.Node>,
+): boolean => {
+  let assignment: t.AssignmentExpression | undefined;
+  let parent = parents.get(member);
+  while (parent !== undefined && parent !== readAt) {
+    if (t.isAssignmentExpression(parent)) {
+      let cursor: t.Node | undefined = member;
+      while (cursor !== undefined && cursor !== parent) {
+        const next = parents.get(cursor);
+        if (next === parent && parent.right === cursor) assignment = parent;
+        cursor = next;
+      }
+    }
+    // An assignment inside a function runs with that function, not before it.
+    if (t.isFunction(parent)) return false;
+    parent = parents.get(parent);
+  }
+  return assignment !== undefined;
+};
 
 const projectedLoaderSources = (
   current: ModuleObjectSource,
@@ -1125,7 +1142,7 @@ const loaderObjectPropertySources = (
   return semanticAliasSelectionChoices(key).flatMap((choice) =>
     (t.isObjectExpression(object)
       ? semanticObjectPropertyReferences(object, [choice], state)
-      : semanticArrayPropertyReferences(object, [choice])
+      : semanticArrayPropertyReferences(object, [choice], state)
     )
       .filter(
         (source) =>
@@ -1179,7 +1196,7 @@ const hasCommonJsModuleSource = (
   // Keep depths separate and join finite key alternatives at each source read.
   const selections = new SemanticAliasSelections(() => {
     state.valueResourceLimits.add("alias-selections");
-  });
+  }, state.precision.alias_selections);
   const contexts = new WeakMap<
     t.Node,
     Map<
@@ -1228,10 +1245,10 @@ const hasCommonJsModuleSource = (
       // Consumption contexts must not provide an unbounded second path to
       // expansion beyond the shared selector budget.
       if (exhausted) {
-        if (++drained > SEMANTIC_ALIAS_SELECTION_LIMIT) return "incomplete";
+        if (++drained > state.precision.alias_selections) return "incomplete";
       } else if (
         (byMode.size > 1 || context.identities.size > 0) &&
-        ++additionalStates > SEMANTIC_ALIAS_SELECTION_LIMIT
+        ++additionalStates > state.precision.alias_selections
       ) {
         state.valueResourceLimits.add("alias-selections");
         if (includeUnknown) return "possible";
@@ -1276,7 +1293,9 @@ const hasCommonJsModuleSource = (
       continue;
     }
     if (t.isMemberExpression(value) || t.isOptionalMemberExpression(value)) {
-      enqueue(loaderMemberSource({ ...next, path }, value));
+      enqueue(
+        loaderMemberSource({ ...next, path }, value, state.parentsByNode),
+      );
       continue;
     }
     if (
@@ -1529,7 +1548,7 @@ export const semanticModuleRequireCallAt = (
   if (isCommonJsRequireDelegate(target, state, includeUnknown, node))
     return true;
   if (t.isNewExpression(node)) return false;
-  const interop = loaderInvocationInterop(state);
+  const interop = semanticModuleInteropWithAmbientWrites(state);
   return (
     interop.intrinsicInvocation(node, (callee) =>
       isCommonJsRequireDelegate(callee, state, false, node)
@@ -1539,38 +1558,130 @@ export const semanticModuleRequireCallAt = (
   );
 };
 
+/**
+ * An exhausted selector walk can still exclude the host on a closed graph of
+ * local values. Follow every retained source and member-write RHS without
+ * expanding selector paths. Opaque inputs and an unfinished graph stay unknown.
+ */
+const hasClosedLocalReceiverSources = (
+  root: t.Node,
+  write: t.Node,
+  state: JavaScriptSemanticAnalysisState,
+): boolean => {
+  if (
+    !state.memberMutationFactsComplete ||
+    // The closure follows inherited members without selecting a read time.
+    semanticGlobalCodeSites(state).length > 0 ||
+    semanticPrototypeOwners.some((owner) =>
+      ambientPathOrMemberMayHaveChanged(state, ["global", owner]),
+    )
+  )
+    return false;
+  const pending: t.Node[] = [];
+  const scheduled = new Set<t.Node>();
+  const enqueue = (source: t.Node): boolean => {
+    const node = unwrapJavaScriptExpression(source).node;
+    if (scheduled.has(node)) return true;
+    if (scheduled.size >= state.precision.alias_selections) return false;
+    scheduled.add(node);
+    pending.push(node);
+    return true;
+  };
+  if (!enqueue(root)) return false;
+  const bindings = new Set<string>();
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    if (t.isIdentifier(node)) {
+      const binding = resolveSemanticBindingState(state, node, node.name);
+      if (
+        binding === undefined ||
+        semanticResolutionBlocked(state, node, node.name) ||
+        commonJsWrapperBindingDeclaration(node, node.name, state) !==
+          undefined ||
+        binding.definitions.some(
+          ({ kind }) => kind === "parameter" || kind === "catch",
+        ) ||
+        binding.directOrigins.length !== 0 ||
+        binding.initializers.length === 0 ||
+        bindingHasUnmodeledMemberValues(binding, write, state) ||
+        opaqueCodeMayRebindBinding(binding, state, node)
+      )
+        return false;
+      if (bindings.has(binding.bindingId)) continue;
+      bindings.add(binding.bindingId);
+      for (const sources of [
+        binding.initializers,
+        binding.referenceInitializers,
+        semanticMemberWriteSources(binding),
+      ])
+        for (const source of sources) {
+          if (semanticReferenceIterationUnknown(source, state)) return false;
+          if (
+            !semanticReferenceSourcesInactive(source, state) &&
+            !enqueue(source.node)
+          )
+            return false;
+        }
+    } else if (
+      t.isMemberExpression(node) ||
+      t.isOptionalMemberExpression(node)
+    ) {
+      if (!enqueue(node.object)) return false;
+    } else if (t.isObjectExpression(node)) {
+      for (const property of node.properties) {
+        if (
+          !t.isObjectProperty(property) ||
+          semanticStaticPropertyKey(property.key, property.computed) ===
+            "__proto__"
+        )
+          return false;
+        if (!enqueue(property.value)) return false;
+      }
+    } else if (t.isArrayExpression(node)) {
+      for (const element of node.elements) {
+        if (t.isSpreadElement(element)) return false;
+        if (element !== null && !enqueue(element)) return false;
+      }
+    } else if (t.isConditionalExpression(node) || t.isLogicalExpression(node)) {
+      const [left, right] = t.isConditionalExpression(node)
+        ? [node.consequent, node.alternate]
+        : [node.left, node.right];
+      if (!enqueue(left) || !enqueue(right)) return false;
+    } else if (!readExactJavaScriptLiteral(node).found) {
+      return false;
+    }
+  }
+  return true;
+};
+
 const writesModuleRequire = (
   state: JavaScriptSemanticAnalysisState,
-): readonly ModuleRequireWrite[] => {
+): readonly t.Node[] => {
   const cached = moduleRequireWrites.get(state);
   if (cached !== undefined) return cached;
   // Interop invocation resolution may ask for require provenance while this
   // index is being built. Publish a temporary empty result to break that cycle.
   moduleRequireWrites.set(state, []);
-  const writes: ModuleRequireWrite[] = [];
+  const writes: t.Node[] = [];
   const interop = createSemanticModuleInterop(state);
-  const isModuleObject = (node: t.Node): ModuleSourceMatch =>
-    hasCommonJsModuleSource(node, state, false, "module");
   const record = (node: t.Node, receiver: t.Node): void => {
-    const resolution = isModuleObject(receiver);
-    if (resolution !== "no-match") writes.push({ node, resolution });
+    const resolution = hasCommonJsModuleSource(
+      receiver,
+      state,
+      false,
+      "module",
+    );
+    if (
+      resolution === "possible" ||
+      (resolution === "incomplete" &&
+        !hasClosedLocalReceiverSources(receiver, node, state))
+    )
+      writes.push(node);
   };
   traverseJavaScriptValueAst(state.program, state.erasedSyntaxNodes, {
     enter: (node) => {
-      const target = t.isAssignmentExpression(node)
-        ? node.left
-        : t.isUpdateExpression(node) ||
-            t.isUnaryExpression(node, { operator: "delete" })
-          ? node.argument
-          : undefined;
-      if (
-        t.isMemberExpression(target) ||
-        t.isOptionalMemberExpression(target)
-      ) {
-        const key = semanticStaticPropertyKey(target.property, target.computed);
-        if (key === "require" || (key === null && target.computed))
-          record(node, target.object);
-      }
+      for (const target of commonJsDelegateWriteTargets(node))
+        record(node, target.object);
       if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) {
         const invocation = interop.intrinsicInvocation(node);
         const owner =
@@ -1584,42 +1695,21 @@ const writesModuleRequire = (
           const key = interop.staticString(args?.[1]);
           if (key === "require" || key === undefined)
             record(node, args?.[0] ?? t.nullLiteral());
+        } else if (owner === "Reflect" && method === "set") {
+          const key = interop.staticString(args?.[1]);
+          if (key === "require" || key === undefined)
+            record(node, args?.[3] ?? args?.[0] ?? t.nullLiteral());
         } else if (owner === "Object" && method === "defineProperties") {
           const descriptors = args?.[1];
-          if (
-            !t.isObjectExpression(descriptors) ||
-            descriptors.properties.some(
-              (property) =>
-                t.isSpreadElement(property) ||
-                (t.isObjectProperty(property) &&
-                  semanticStaticPropertyKey(property.key, property.computed) ===
-                    "require"),
-            )
-          )
+          if (objectMayProvideRequire(descriptors))
             record(node, args?.[0] ?? t.nullLiteral());
         } else if (owner === "Object" && method === "assign") {
           const target = args?.[0];
-          if (target !== undefined) {
-            const sourceHasRequire = args
-              ?.slice(1)
-              .some(
-                (arg) =>
-                  t.isObjectExpression(arg) &&
-                  arg.properties.some(
-                    (property) =>
-                      t.isObjectProperty(property) &&
-                      semanticStaticPropertyKey(
-                        property.key,
-                        property.computed,
-                      ) === "require",
-                  ),
-              );
-            if (
-              sourceHasRequire ||
-              args?.slice(1).some((arg) => !t.isObjectExpression(arg))
-            )
-              record(node, target);
-          }
+          if (
+            target !== undefined &&
+            args?.slice(1).some(objectMayProvideRequire)
+          )
+            record(node, target);
         }
       }
     },
@@ -1628,45 +1718,76 @@ const writesModuleRequire = (
   return writes;
 };
 
+/** Methods, spreads and unknown computed keys can all supply an own delegate. */
+const objectMayProvideRequire = (node: t.Node | undefined): boolean =>
+  !t.isObjectExpression(node) ||
+  node.properties.some((property) => {
+    if (t.isSpreadElement(property)) return true;
+    const key = semanticStaticPropertyKey(property.key, property.computed);
+    return key === "require" || key === null;
+  });
+
 /** Whether the original global process object can still own effects at this source site. */
 export const semanticOriginalGlobalProcessAt = (
   node: t.Node,
   state: JavaScriptSemanticAnalysisState,
+): boolean =>
+  !ambientPathMayObserveAt(state, node, ["global", "process"]) &&
+  !ambientBindingMayObserveWriteAt(state, node, "process");
+
+const globalProcessReaders = new WeakMap<
+  JavaScriptSemanticAnalysisState,
+  (site: t.Node) => GlobalReferenceRead
+>();
+
+/**
+ * Whether a write or escape through the global process object at this source
+ * site may still reach the original object: the global path reader does not
+ * prove a replacement with a fresh object before it. Reads that need a
+ * definite identity ask `semanticOriginalGlobalProcessAt` instead.
+ */
+export const semanticEffectMayReachOriginalGlobalProcess = (
+  node: t.Node,
+  state: JavaScriptSemanticAnalysisState,
 ): boolean => {
-  let replacements = globalProcessReplacements.get(state);
-  if (replacements === undefined) {
-    replacements = [
-      ...state.ambientWriteEffects
-        .filter(
-          ({ path }) =>
-            path.length <= 2 &&
-            path.every((key, index) =>
-              semanticPropertyPathKeyMatches(
-                key,
-                ["global", "process"][index]!,
-              ),
-            ),
-        )
-        .map(({ node: write }) => write),
-      ...(state.ambientBindingWrites.get("process") ?? []),
-    ];
-    globalProcessReplacements.set(state, replacements);
+  let read = globalProcessReaders.get(state);
+  if (read === undefined) {
+    read = createGlobalPathReader(state, ["process"]);
+    globalProcessReaders.set(state, read);
   }
-  return !replacements.some(
-    (write) =>
-      !semanticTopLevelEffectFollowsCapture(node, write, state.parentsByNode),
+  const fact = read(node);
+  return (
+    fact.status !== "replacement" ||
+    !hasFreshProjectedReceiver(fact.value, [], state)
   );
 };
+
+/**
+ * What a global process reference is used for. A `"read"` needs the original
+ * object for certain; an `"effect"` (a write or an escape through the
+ * reference) is attributed to it while it may still be the original.
+ */
+export type SemanticGlobalProcessUse = "read" | "effect";
+
+const globalProcessAt = (
+  node: t.Node,
+  state: JavaScriptSemanticAnalysisState,
+  use: SemanticGlobalProcessUse,
+): boolean =>
+  use === "read"
+    ? semanticOriginalGlobalProcessAt(node, state)
+    : semanticEffectMayReachOriginalGlobalProcess(node, state);
 
 /** Node's unbound process reference shares the cached process exports object. */
 export const semanticGlobalProcessOrigin = (
   node: t.Node,
   state: JavaScriptSemanticAnalysisState,
+  use: SemanticGlobalProcessUse = "read",
 ): JavaScriptModuleOrigin | undefined =>
   t.isIdentifier(node, { name: "process" }) &&
   resolveSemanticBindingState(state, node, "process") === undefined &&
   !semanticResolutionBlocked(state, node, "process") &&
-  semanticOriginalGlobalProcessAt(node, state)
+  globalProcessAt(node, state, use)
     ? { specifier: "node:process", importedPath: [], resolutionMode: "require" }
     : undefined;
 
@@ -1674,6 +1795,7 @@ export const semanticGlobalProcessOrigin = (
 export const semanticGlobalProcessPathOrigin = (
   node: t.Node,
   state: JavaScriptSemanticAnalysisState,
+  use: SemanticGlobalProcessUse = "read",
 ): JavaScriptModuleOrigin | undefined => {
   const chain = semanticMemberChain(node);
   if (chain === undefined) return undefined;
@@ -1684,7 +1806,7 @@ export const semanticGlobalProcessPathOrigin = (
     resolveSemanticBindingState(state, current, current.name) !== undefined ||
     semanticResolutionBlocked(state, current, current.name) ||
     members[0] !== "process" ||
-    !semanticOriginalGlobalProcessAt(node, state)
+    !globalProcessAt(node, state, use)
   )
     return undefined;
   return {
@@ -1724,10 +1846,7 @@ const isConditionalRequireAt = (
         )))
   )
     return false;
-  return !(state.ambientBindingWrites.get("require") ?? []).some(
-    (write) =>
-      !semanticTopLevelEffectFollowsCapture(node, write, state.parentsByNode),
-  );
+  return !ambientBindingMayObserveWriteAt(state, node, "require");
 };
 
 /** Recover an unshadowed literal require origin and its exact member path. */
@@ -1769,14 +1888,7 @@ export const semanticRequireOriginCandidate = (
         (binding === undefined &&
           (javaScriptRuntimeContext(state.program) === "module" ||
             semanticResolutionBlocked(state, current.callee, "require"))) ||
-        (state.ambientBindingWrites.get("require") ?? []).some(
-          (write) =>
-            !semanticTopLevelEffectFollowsCapture(
-              current,
-              write,
-              state.parentsByNode,
-            ),
-        )
+        ambientBindingMayObserveWriteAt(state, current, "require")
   )
     return undefined;
   const specifier = stringValue(current.arguments[0]);
@@ -1809,6 +1921,9 @@ export const semanticRequireExportsIdentity = <Key>(
 ): { readonly specifier: string; readonly path: readonly (Key | string)[] } => {
   const name = specifier.replace(/^node:/u, "");
   if (name === "fs/promises") return { specifier: name, path };
+  // The events export and its EventEmitter alias expose the same constructor.
+  if (name === "events" && path[0] === "EventEmitter" && path.length > 1)
+    return { specifier: name, path: path.slice(1) };
   if (["path", "path/posix", "path/win32"].includes(name)) {
     let selected = name;
     let remaining = path;
@@ -1831,6 +1946,7 @@ const MUTABLE_BUILTIN_DEFAULTS = new Set([
   "http",
   "https",
   "child_process",
+  "events",
   "timers",
   "process",
   "path",
@@ -1852,6 +1968,8 @@ export const semanticMutableBuiltinOrigin = <Key = never>(
   const specifier = origin.specifier.replace(/^node:/u, "");
   if (!MUTABLE_BUILTIN_DEFAULTS.has(specifier)) return undefined;
   if (path[0] === "default") return { specifier, path: path.slice(1) };
+  if (specifier === "events" && path[0] === "EventEmitter" && path.length > 1)
+    return { specifier, path };
   if (specifier === "process" && (path[0] === "env" || path[0] === "argv"))
     return { specifier, path };
   return specifier === "fs" && path[0] === "promises"
